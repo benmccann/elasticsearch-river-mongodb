@@ -35,7 +35,7 @@ public class RestMongoDBRiverAction extends BaseRestHandler {
 
     @Inject
     public RestMongoDBRiverAction(Settings settings, Client esClient, RestController controller, @RiverIndexName String riverIndexName) {
-        super(settings, controller, esClient);
+        super(settings, esClient);
         this.riverIndexName = riverIndexName;
         String baseUrl = "/" + riverIndexName + "/" + MongoDBRiver.TYPE;
         logger.trace("RestMongoDBRiverAction - baseUrl: {}", baseUrl);

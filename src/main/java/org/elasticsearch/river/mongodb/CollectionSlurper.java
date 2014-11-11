@@ -2,10 +2,8 @@ package org.elasticsearch.river.mongodb;
 
 import java.util.concurrent.atomic.AtomicLong;
 
-import org.bson.BasicBSONObject;
 import org.bson.types.ObjectId;
 import org.elasticsearch.client.Client;
-import org.elasticsearch.common.collect.ImmutableList;
 import org.elasticsearch.common.collect.ImmutableMap;
 import org.elasticsearch.common.logging.ESLogger;
 import org.elasticsearch.common.logging.ESLoggerFactory;
@@ -13,8 +11,6 @@ import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.river.mongodb.util.MongoDBHelper;
 import org.elasticsearch.river.mongodb.util.MongoDBRiverHelper;
 
-import com.google.common.base.Preconditions;
-import com.mongodb.BasicDBObject;
 import com.mongodb.DB;
 import com.mongodb.DBCollection;
 import com.mongodb.DBCursor;
@@ -24,7 +20,6 @@ import com.mongodb.MongoCursorNotFoundException;
 import com.mongodb.MongoInterruptedException;
 import com.mongodb.MongoSocketException;
 import com.mongodb.MongoTimeoutException;
-import com.mongodb.QueryOperators;
 import com.mongodb.gridfs.GridFS;
 import com.mongodb.gridfs.GridFSDBFile;
 import com.mongodb.gridfs.GridFSFile;
@@ -119,82 +114,62 @@ class CollectionSlurper implements Runnable {
         // slurpedDb.getCollection(definition.getMongoCollection());
 
         logger.info("MongoDBRiver is beginning initial import of " + collection.getFullName());
-        boolean inProgress = true;
-        String lastId = null;
-        while (inProgress) {
-            DBCursor cursor = null;
-            try {
-                if (definition.isDisableIndexRefresh()) {
-                    updateIndexRefresh(definition.getIndexName(), -1L);
+        DBCursor cursor = null;
+        try {
+            if (definition.isDisableIndexRefresh()) {
+                updateIndexRefresh(definition.getIndexName(), -1L);
+            }
+            if (!definition.isMongoGridFS()) {
+                if (logger.isTraceEnabled()) {
+                    // Note: collection.count() is expensive on TokuMX
+                    logger.trace("Collection {} - count: {}", collection.getName(), collection.count());
                 }
-                if (!definition.isMongoGridFS()) {
-                    if (logger.isTraceEnabled()) {
-                        // Note: collection.count() is expensive on TokuMX
-                        logger.trace("Collection {} - count: {}", collection.getName(), collection.count());
+                long count = 0;
+                cursor = collection.find(definition.getMongoCollectionFilter());
+                while (cursor.hasNext() && context.getStatus() == Status.RUNNING) {
+                    DBObject object = cursor.next();
+                    count++;
+                    if (cursor.hasNext()) {
+                      addInsertToStream(null, applyFieldFilter(object), collection.getName());
+                    } else {
+                      logger.debug("Last entry for initial import of {} - add timestamp: {}", collection.getFullName(), timestamp);
+                      addInsertToStream(timestamp, applyFieldFilter(object), collection.getName());
                     }
-                    long count = 0;
-                    cursor = collection
-                            .find(getFilterForInitialImport(definition.getMongoCollectionFilter(), lastId))
-                            .sort(new BasicDBObject("_id", 1));
-                    while (cursor.hasNext() && context.getStatus() == Status.RUNNING) {
-                        DBObject object = cursor.next();
-                        count++;
-                        if (cursor.hasNext()) {
-                          lastId = addInsertToStream(null, applyFieldFilter(object), collection.getName());
-                        } else {
-                          logger.debug("Last entry for initial import of {} - add timestamp: {}", collection.getFullName(), timestamp);
-                          lastId = addInsertToStream(timestamp, applyFieldFilter(object), collection.getName());
-                        }
-                    }
-                    inProgress = false;
-                    logger.info("Number of documents indexed in initial import of {}: {}", collection.getFullName(), count);
-                } else {
-                    // TODO: To be optimized.
-                    // https://github.com/mongodb/mongo-java-driver/pull/48#issuecomment-25241988
-                    // possible option: Get the object id list from .fs collection then call GriDFS.findOne
-                    GridFS grid = new GridFS(mongoClient.getDB(definition.getMongoDb()), definition.getMongoCollection());
+                }
+                logger.info("Number of documents indexed in initial import of {}: {}", collection.getFullName(), count);
+            } else {
+                // TODO: To be optimized.
+                // https://github.com/mongodb/mongo-java-driver/pull/48#issuecomment-25241988
+                // possible option: Get the object id list from .fs collection then call GriDFS.findOne
+                GridFS grid = new GridFS(mongoClient.getDB(definition.getMongoDb()), definition.getMongoCollection());
 
-                    cursor = grid.getFileList();
-                    while (cursor.hasNext()) {
-                        DBObject object = cursor.next();
-                        if (object instanceof GridFSDBFile) {
-                            GridFSDBFile file = grid.findOne(new ObjectId(object.get(MongoDBRiver.MONGODB_ID_FIELD).toString()));
-                            if (cursor.hasNext()) {
-                              lastId = addInsertToStream(null, file);
-                            } else {
-                              logger.debug("Last entry for initial import of {} - add timestamp: {}", collection.getFullName(), timestamp);
-                              lastId = addInsertToStream(timestamp, file);
-                            }
+                cursor = grid.getFileList();
+                while (cursor.hasNext()) {
+                    DBObject object = cursor.next();
+                    if (object instanceof GridFSDBFile) {
+                        GridFSDBFile file = grid.findOne(new ObjectId(object.get(MongoDBRiver.MONGODB_ID_FIELD).toString()));
+                        if (cursor.hasNext()) {
+                            addInsertToStream(null, file);
+                        } else {
+                            logger.debug("Last entry for initial import of {} - add timestamp: {}", collection.getFullName(), timestamp);
+                            addInsertToStream(timestamp, file);
                         }
                     }
-                    inProgress = false;
-                }
-            } catch (MongoSocketException | MongoTimeoutException | MongoCursorNotFoundException e) {
-                logger.info("Initial import - {} - {}. Will retry.", e.getClass().getSimpleName(), e.getMessage());
-                logger.debug("Total documents inserted so far by river {}: {}", definition.getRiverName(), totalDocuments.get());
-                Thread.sleep(MongoDBRiver.MONGODB_RETRY_ERROR_DELAY_MS);
-            } finally {
-                if (cursor != null) {
-                    logger.trace("Closing initial import cursor");
-                    cursor.close();
-                }
-                if (definition.isDisableIndexRefresh()) {
-                    updateIndexRefresh(definition.getIndexName(), TimeValue.timeValueSeconds(1));
                 }
             }
-        }
-    }
-
-    private BasicDBObject getFilterForInitialImport(BasicDBObject filter, String id) {
-        Preconditions.checkNotNull(filter);
-        if (id == null) {
-            return filter;
-        }
-        BasicDBObject idFilter = new BasicDBObject(MongoDBRiver.MONGODB_ID_FIELD, new BasicBSONObject(QueryOperators.GT, id));
-        if (filter.equals(new BasicDBObject())) {
-            return idFilter;
-        }
-        return new BasicDBObject(QueryOperators.AND, ImmutableList.of(filter, idFilter));
+        } catch (MongoSocketException | MongoTimeoutException | MongoCursorNotFoundException e) {
+            logger.info("Initial import - {} - {}. Will retry.", e.getClass().getSimpleName(), e.getMessage());
+            logger.debug("Total documents inserted so far by river {}: {}", definition.getRiverName(), totalDocuments.get());
+            Thread.sleep(MongoDBRiver.MONGODB_RETRY_ERROR_DELAY_MS);
+        } finally {
+            if (cursor != null) {
+                logger.trace("Closing initial import cursor");
+                cursor.close();
+            }
+            if (definition.isDisableIndexRefresh()) {
+                updateIndexRefresh(definition.getIndexName(), TimeValue.timeValueSeconds(1));
+            }
+        }        
     }
 
     private void updateIndexRefresh(String name, Object value) {
